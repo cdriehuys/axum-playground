@@ -1,13 +1,18 @@
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{FromRef, State},
-    routing::post,
-    Json, Router,
+    async_trait,
+    extract::{FromRef, FromRequestParts, State},
+    headers::{authorization::Bearer, Authorization},
+    http::{request::Parts, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, RequestPartsExt, Router, TypedHeader,
 };
 use chrono::{Duration, Utc};
-use jsonwebtoken::{encode, DecodingKey, EncodingKey, Header};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tracing::info;
 
 #[derive(Clone)]
@@ -40,6 +45,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/tokens", post(create_token))
+        .route("/whoami", get(whoami))
         .with_state(state);
 
     let addr: SocketAddr = "0.0.0.0:8000".parse().unwrap();
@@ -83,4 +89,61 @@ struct TokenClaims {
 #[derive(Serialize)]
 struct TokenResponse {
     token: String,
+}
+
+#[async_trait]
+impl<S> FromRequestParts<S> for TokenClaims
+where
+    DecodingKey: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let jwt_decoding_key = DecodingKey::from_ref(state);
+
+        let TypedHeader(Authorization(bearer)) = parts
+            .extract::<TypedHeader<Authorization<Bearer>>>()
+            .await
+            .map_err(|_| AuthError::MissingCredentials)?;
+
+        let token_data =
+            decode::<TokenClaims>(bearer.token(), &jwt_decoding_key, &Validation::default())
+                .map_err(|_| AuthError::InvalidToken)?;
+
+        Ok(token_data.claims)
+    }
+}
+
+async fn whoami(
+    claims: TokenClaims,
+    State(_state): State<AppState>,
+) -> Result<Json<WhoAmI>, AuthError> {
+    Ok(Json(WhoAmI { name: claims.name }))
+}
+
+#[derive(Serialize)]
+struct WhoAmI {
+    name: String,
+}
+
+#[derive(Debug)]
+enum AuthError {
+    InvalidToken,
+    MissingCredentials,
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            Self::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid token."),
+            Self::MissingCredentials => (StatusCode::UNAUTHORIZED, "No token provided."),
+        };
+
+        let body = Json(json!({
+            "error": message,
+        }));
+
+        (status, body).into_response()
+    }
 }
