@@ -10,26 +10,21 @@ use axum::{
     Json, RequestPartsExt, Router, TypedHeader,
 };
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::info;
 
+use axum_playground::auth;
+
 #[derive(Clone)]
 struct AppState {
-    jwt_decoding_key: DecodingKey,
-    jwt_encoding_key: EncodingKey,
+    keys: auth::Keys,
 }
 
-impl FromRef<AppState> for DecodingKey {
+impl FromRef<AppState> for auth::Keys {
     fn from_ref(state: &AppState) -> Self {
-        state.jwt_decoding_key.clone()
-    }
-}
-
-impl FromRef<AppState> for EncodingKey {
-    fn from_ref(state: &AppState) -> Self {
-        state.jwt_encoding_key.clone()
+        state.keys.clone()
     }
 }
 
@@ -39,8 +34,7 @@ async fn main() {
 
     let key = b"secret";
     let state = AppState {
-        jwt_decoding_key: DecodingKey::from_secret(key),
-        jwt_encoding_key: EncodingKey::from_secret(key),
+        keys: auth::Keys::from_secret(key),
     };
 
     let app = Router::new()
@@ -58,7 +52,7 @@ async fn main() {
 }
 
 async fn create_token(
-    State(jwt_encoding_key): State<EncodingKey>,
+    State(jwt_keys): State<auth::Keys>,
     Json(payload): Json<CreateToken>,
 ) -> Json<TokenResponse> {
     let now = Utc::now();
@@ -70,7 +64,7 @@ async fn create_token(
     };
 
     let token =
-        encode(&Header::default(), &claims, &jwt_encoding_key).expect("failed to encode token");
+        encode(&Header::default(), &claims, jwt_keys.encoding()).expect("failed to encode token");
 
     Json(TokenResponse { token })
 }
@@ -94,13 +88,13 @@ struct TokenResponse {
 #[async_trait]
 impl<S> FromRequestParts<S> for TokenClaims
 where
-    DecodingKey: FromRef<S>,
+    auth::Keys: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = AuthError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let jwt_decoding_key = DecodingKey::from_ref(state);
+        let jwt_keys = auth::Keys::from_ref(state);
 
         let TypedHeader(Authorization(bearer)) = parts
             .extract::<TypedHeader<Authorization<Bearer>>>()
@@ -108,7 +102,7 @@ where
             .map_err(|_| AuthError::MissingCredentials)?;
 
         let token_data =
-            decode::<TokenClaims>(bearer.token(), &jwt_decoding_key, &Validation::default())
+            decode::<TokenClaims>(bearer.token(), jwt_keys.decoding(), &Validation::default())
                 .map_err(|_| AuthError::InvalidToken)?;
 
         Ok(token_data.claims)
