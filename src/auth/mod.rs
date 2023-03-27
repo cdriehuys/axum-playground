@@ -12,6 +12,8 @@
 // 2. Validate
 // 3. Deliver new access token
 
+pub mod auth0;
+
 use jsonwebtoken::{DecodingKey, EncodingKey};
 
 /// Container for the keys used to decode/encode JWTs.

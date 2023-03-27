@@ -10,8 +10,10 @@ axum = { version = "0.6.12", features = ["headers"] }
 axum-macros = { version = "*" }
 chrono = { version = "0.4.24" }
 jsonwebtoken = { version = "8.3.0" }
+reqwest = { version = "0.11.15", features = ["json"] }
 serde = { version = "1.0.158", features = ["derive"] }
 serde_json = { version = "1.0.94" }
+thiserror = { version = "1.0.40" }
 tokio = { version = "1.26.0", features = ["full"] }
 tracing = { version = "0.1.37" }
-tracing-subscriber = { version = "0.3.16" }
+tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }

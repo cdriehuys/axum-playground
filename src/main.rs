@@ -2,27 +2,26 @@ use std::net::SocketAddr;
 
 use axum::{
     async_trait,
-    extract::{FromRef, FromRequestParts, State},
+    extract::{FromRef, FromRequestParts},
     headers::{authorization::Bearer, Authorization},
     http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
     Json, RequestPartsExt, Router, TypedHeader,
 };
-use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
+use tracing::{debug, info};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use axum_playground::auth;
+use axum_playground::auth::{self, auth0};
 
 #[derive(Clone)]
 struct AppState {
-    keys: auth::Keys,
+    keys: auth::auth0::KeySet,
 }
 
-impl FromRef<AppState> for auth::Keys {
+impl FromRef<AppState> for auth::auth0::KeySet {
     fn from_ref(state: &AppState) -> Self {
         state.keys.clone()
     }
@@ -30,15 +29,22 @@ impl FromRef<AppState> for auth::Keys {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "axum_playground=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-    let key = b"secret";
-    let state = AppState {
-        keys: auth::Keys::from_secret(key),
-    };
+    let auth0_keys =
+        auth0::KeySet::from_url("https://dev-hn7maq8cvpmas5mn.us.auth0.com/.well-known/jwks.json")
+            .await
+            .expect("Failed to fetch JWKS");
+
+    let state = AppState { keys: auth0_keys };
 
     let app = Router::new()
-        .route("/tokens", post(create_token))
         .route("/whoami", get(whoami))
         .with_state(state);
 
@@ -51,74 +57,86 @@ async fn main() {
         .unwrap();
 }
 
-async fn create_token(
-    State(jwt_keys): State<auth::Keys>,
-    Json(payload): Json<CreateToken>,
-) -> Json<TokenResponse> {
-    let now = Utc::now();
-    let exp = now + Duration::minutes(5);
-
-    let claims = TokenClaims {
-        exp: exp.timestamp(),
-        name: payload.name,
-    };
-
-    let token =
-        encode(&Header::default(), &claims, jwt_keys.encoding()).expect("failed to encode token");
-
-    Json(TokenResponse { token })
-}
-
-#[derive(Deserialize)]
-struct CreateToken {
-    name: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct TokenClaims {
-    exp: i64,
-    name: String,
-}
-
-#[derive(Serialize)]
-struct TokenResponse {
-    token: String,
-}
+#[derive(Debug)]
+struct Token(String);
 
 #[async_trait]
-impl<S> FromRequestParts<S> for TokenClaims
-where
-    auth::Keys: FromRef<S>,
-    S: Send + Sync,
-{
+impl<S> FromRequestParts<S> for Token {
     type Rejection = AuthError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let jwt_keys = auth::Keys::from_ref(state);
-
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let TypedHeader(Authorization(bearer)) = parts
             .extract::<TypedHeader<Authorization<Bearer>>>()
             .await
             .map_err(|_| AuthError::MissingCredentials)?;
 
-        let token_data =
-            decode::<TokenClaims>(bearer.token(), jwt_keys.decoding(), &Validation::default())
-                .map_err(|_| AuthError::InvalidToken)?;
-
-        Ok(token_data.claims)
+        Ok(Self(bearer.token().to_owned()))
     }
 }
 
-async fn whoami(
-    claims: TokenClaims,
-    State(_state): State<AppState>,
-) -> Result<Json<WhoAmI>, AuthError> {
-    Ok(Json(WhoAmI { name: claims.name }))
+#[derive(Debug, Deserialize, Serialize)]
+struct TokenClaims {
+    iss: String,
+    sub: String,
+}
+
+#[async_trait]
+impl<S> FromRequestParts<S> for TokenClaims
+where
+    auth::auth0::KeySet: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let token = Token::from_request_parts(parts, state).await?;
+        let jwt_keys = auth::auth0::KeySet::from_ref(state);
+
+        let claims: Self = jwt_keys.validate_claims(&token.0).map_err(|error| {
+            debug!(%error, "Received invalid token.");
+
+            AuthError::InvalidToken
+        })?;
+
+        Ok(claims)
+    }
+}
+
+async fn whoami(access_token: Token, claims: TokenClaims) -> Result<Json<WhoAmI>, AuthError> {
+    let profile_url = format!("{}userinfo", &claims.iss);
+    debug!(profile_url, ?access_token, "Retrieving user profile.");
+    let client = reqwest::Client::new();
+    let profile: Auth0Profile = client
+        .get(profile_url)
+        .bearer_auth(&access_token.0)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    info!(?profile, "Retrieved user profile.");
+
+    Ok(Json(WhoAmI {
+        id: profile.sub,
+        name: profile.name,
+        email: profile.email,
+    }))
 }
 
 #[derive(Serialize)]
 struct WhoAmI {
+    id: String,
     name: String,
+    email: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Auth0Profile {
+    email: String,
+    name: String,
+    sub: String,
 }
 
 #[derive(Debug)]
